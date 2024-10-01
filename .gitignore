@@ -1,3 +1,5 @@
+.venv/
+.hermit/
 __pycache__
 .idea
 .DS_Store
