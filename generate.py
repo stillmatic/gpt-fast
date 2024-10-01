@@ -41,18 +41,29 @@ def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling with
     q = torch.empty_like(probs_sort).exponential_(1)
     return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
 
-def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = None):
+def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = None, min_p: Optional[float] = None):
+    # Apply temperature scaling
     logits = logits / max(temperature, 1e-5)
 
+    # Apply top-k filtering if specified
     if top_k is not None:
         v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
         pivot = v.select(-1, -1).unsqueeze(-1)
         logits = torch.where(logits < pivot, -float("Inf"), logits)
+    # Convert logits to probabilities
     probs = torch.nn.functional.softmax(logits, dim=-1)
+
+    if min_p is not None:
+        max_prob = probs.max()
+        p_threshold = min_p * max_prob
+        mask = probs >= p_threshold
+        probs = probs * mask.float()
+        probs = probs / probs.sum()
+
     return probs
 
-def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None):
-    probs = logits_to_probs(logits[:, -1], temperature, top_k)
+def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None, min_p: Optional[float] = None):
+    probs = logits_to_probs(logits[:, -1], temperature, top_k, min_p)
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
 
@@ -285,6 +296,7 @@ def main(
     draft_checkpoint_path: Optional[Path] = None,
     speculate_k: int = 5,
     device=default_device,
+    min_p: Optional[float] = None,
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
@@ -396,6 +408,7 @@ def main(
                 callback=callback,
                 temperature=temperature,
                 top_k=top_k,
+                min_p=min_p,
             )
             aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
         if i == -1:
@@ -457,6 +470,7 @@ if __name__ == '__main__':
     parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
     parser.add_argument('--batch_size', type=int, default=1, help='Batch size to benchmark with')
     parser.add_argument('--top_k', type=int, default=200, help='Top-k for sampling.')
+    parser.add_argument('--min_p', type=float, default=None, help='Min-p for sampling.')
     parser.add_argument('--temperature', type=float, default=0.8, help='Temperature for sampling.')
     parser.add_argument('--checkpoint_path', type=Path, default=Path("checkpoints/meta-Transformer/Transformer-2-7b-chat-hf/model.pth"), help='Model checkpoint path.')
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
@@ -470,5 +484,5 @@ if __name__ == '__main__':
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device
+        args.speculate_k, args.device, args.min_p
     )
