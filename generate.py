@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 import torch._dynamo.config
 import torch._inductor.config
 
@@ -37,6 +38,8 @@ sys.path.append(str(wd))
 from model import Transformer
 from tokenizer import get_tokenizer
 
+ENTROPY_BOUNDS = (0.01, 0.7)
+
 def multinomial_sample_one_no_sync(probs_sort): # Does multinomial sampling without a cuda synchronization
     q = torch.empty_like(probs_sort).exponential_(1)
     return torch.argmax(probs_sort / q, dim=-1, keepdim=True).to(dtype=torch.int)
@@ -62,9 +65,29 @@ def logits_to_probs(logits, temperature: float = 1.0, top_k: Optional[int] = Non
 
     return probs
 
+def compute_entropy_and_varentropy(probs):
+    # Ensure probs sum to 1 and handle zero probabilities
+    probs = probs.clamp(min=1e-12)
+    probs = probs / probs.sum()
+
+    # Compute entropy
+    log_probs = torch.log2(probs)  # Using log base 2
+    entropy = -torch.sum(probs * log_probs)
+
+    # Compute variance of entropy
+    neg_log_probs_squared = (-log_probs) ** 2
+    expected_neg_log_probs_squared = torch.sum(probs * neg_log_probs_squared)
+    varentropy = expected_neg_log_probs_squared - entropy**2
+
+    return entropy, varentropy
+
+
 def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None, min_p: Optional[float] = None):
     probs = logits_to_probs(logits[:, -1], temperature, top_k, min_p)
+    entropy, varentropy = compute_entropy_and_varentropy(probs)
+    
     idx_next = multinomial_sample_one_no_sync(probs)
+    print(f"Entropy: {entropy.item():.02f}, Varentropy: {varentropy.item():.02f}")
     return idx_next, probs
 
 def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
@@ -78,13 +101,14 @@ def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tenso
     logits = model(x, input_pos)
     return sample(logits, **sampling_kwargs)
 
-def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, callback=lambda _: _, **sampling_kwargs):
+def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, tokenizer, callback=lambda _: _, **sampling_kwargs):
     new_tokens, new_probs = [], []
     for i in range(num_new_tokens):
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
             next_token, next_prob = decode_one_token(
                 model, cur_token, input_pos, **sampling_kwargs
             )
+            print(tokenizer.decode(next_token.view(-1).tolist()))
             input_pos += 1
             new_tokens.append(next_token.clone())
             callback(new_tokens[-1])
@@ -153,6 +177,7 @@ def generate(
     prompt: torch.Tensor,
     max_new_tokens: int,
     batch_size: int,
+    tokenizer,
     *,
     interactive: bool,
     draft_model: Transformer,
@@ -213,7 +238,7 @@ def generate(
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(model, next_token.view(batch_size, -1), input_pos, max_new_tokens - 1, callback=callback, **sampling_kwargs)
+        generated_tokens, _ = decode_n_tokens(model, next_token.view(batch_size, -1), input_pos, max_new_tokens - 1, tokenizer, callback=callback, **sampling_kwargs)
         seq[:, T + 1:] = torch.cat(generated_tokens, dim=-1)
 
     generate_stats = {
@@ -401,6 +426,7 @@ def main(
                 model,
                 encoded,
                 max_new_tokens,
+                tokenizer=tokenizer,
                 batch_size=batch_size,
                 draft_model=draft_model,
                 speculate_k=speculate_k,
