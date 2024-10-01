@@ -98,8 +98,7 @@ def speculative_decode(
     device = cur_token.device
     orig_input_pos = torch.tensor([input_pos], dtype=torch.int64, device=cur_token.device)
     draft_tokens, draft_probs = decode_n_tokens(draft_model, cur_token.view(1, -1), orig_input_pos.clone(), speculate_k, **sampling_kwargs)
-
-    draft_tokens = torch.cat(draft_tokens)
+    draft_tokens = torch.cat(draft_tokens).view(-1)
     # parallel inference on target model using draft tokens
     target_logits = model_forward(
         model,
@@ -107,7 +106,7 @@ def speculative_decode(
         torch.arange(input_pos, input_pos + speculate_k + 1, device=cur_token.device)
     )
     target_probs = logits_to_probs(target_logits[0], **sampling_kwargs)
-    draft_probs = torch.stack(draft_probs)
+    draft_probs = torch.stack(draft_probs).squeeze(1)
     # q: target prob, p: draft prob
     # q >= p: always accept draft token
     # q < p: q/p prob to accept draft token
@@ -115,7 +114,7 @@ def speculative_decode(
     q = target_probs[torch.arange(0, speculate_k, device=device), draft_tokens]
     accept_draft_prob = torch.minimum(torch.ones(()), q[:speculate_k]/ p)
     rejected_locations = (torch.rand_like(accept_draft_prob) > accept_draft_prob).nonzero()
-
+    final_tokens = None
     if rejected_locations.shape[0] == 0: # All draft tokens have been accepted
         accept_length = speculate_k + 1
         last_token = multinomial_sample_one_no_sync(target_probs[-1])
@@ -125,7 +124,7 @@ def speculative_decode(
             draft_tokens[-1].view(1, -1),
             orig_input_pos + speculate_k,
         )
-        return torch.cat([draft_tokens, last_token])
+        final_tokens= torch.cat([draft_tokens, last_token])
     else:
         accept_length = rejected_locations[0].item()
         p = draft_probs[accept_length]
@@ -134,7 +133,8 @@ def speculative_decode(
         new = torch.where(new > 0, new, 0.0)
         new = new / new.sum()
         next_token = multinomial_sample_one_no_sync(new)
-        return torch.cat([draft_tokens[:accept_length], next_token])
+        final_tokens = torch.cat([draft_tokens[:accept_length], next_token])
+    return final_tokens
 
 @torch.no_grad()
 def generate(
@@ -196,7 +196,7 @@ def generate(
 
             accept_counts[len(next_tokens) - 1] += 1
             num_added = min(T_new - input_pos - 1, len(next_tokens))
-            seq[input_pos + 1 : input_pos + num_added + 1] = next_tokens[: num_added]
+            seq[:, input_pos + 1 : input_pos + num_added + 1] = next_tokens[: num_added]
             for i in next_tokens[: num_added,]:
                 callback(i)
             input_pos = input_pos + num_added
@@ -211,6 +211,7 @@ def generate(
     return seq, generate_stats
 
 def encode_tokens(tokenizer, string, bos=True, device=default_device):
+    # consider not disallowing all tokens
     tokens = tokenizer.encode(string)
     if bos:
         tokens = [tokenizer.bos_id()] + tokens
@@ -436,6 +437,9 @@ def main(
     print(f"Average tokens/sec: {torch.mean(torch.tensor(aggregate_metrics['tokens_per_sec'])).item():.2f}")
     print(f"Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
 
+default_prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+You are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>
+Which number is larger, 9.9 or 9.11?<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
 
 if __name__ == '__main__':
     import argparse
@@ -447,7 +451,7 @@ if __name__ == '__main__':
         except:
             return x
 
-    parser.add_argument('--prompt', type=int_or_str, default="Hello, my name is", help="Input prompt. If it's an integer, will instead generate a synthetic prompt.")
+    parser.add_argument('--prompt', type=int_or_str, default=default_prompt, help="Input prompt. If it's an integer, will instead generate a synthetic prompt.")
     parser.add_argument('--interactive', action='store_true', help='Whether to launch in interactive mode')
     parser.add_argument('--num_samples', type=int, default=5, help='Number of samples.')
     parser.add_argument('--max_new_tokens', type=int, default=200, help='Maximum number of new tokens.')
