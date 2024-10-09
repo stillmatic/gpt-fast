@@ -38,17 +38,18 @@ sys.path.append(str(wd))
 from model import Transformer
 from tokenizer import get_tokenizer
 
-ENTROPY_BOUNDS = (0.1, 3.5)
-VARENTROPY_THRESHOLD = 1.5
-INJECTION_COOLDOWN = 15
-BRANCH_THRESHOLD = 0.5
-ENTROPY_THRESHOLD = 1.0
+ENTROPY_BOUNDS = (0.8, 3.0)
+VARENTROPY_BOUNDS = (1.5, 3.0)
+INJECTION_COOLDOWN = 8
+MAX_BACKSPACES = 30
 NOISE_SCALE = 0.05
-# hardcoded, represents "..." in 1B model
 EOS_TOKEN_ID = 128009
-COT_TOKENS = [1131, 14524, 81122, 11748]
-MAX_INJECTIONS = 3
-PUNCTUATION_TOKENS = [13, 11, 220, 198, 271, 30]
+COT_TOKENS = [14524, 81122, 11748, 12174, 14524, 2319]
+# COT_TOKENS = [1131]
+MAX_INJECTIONS = 5
+PUNCTUATION_TOKENS = [13, 220, 627, 30, 0, 5380]
+
+tokenizer = None
 
 
 def multinomial_sample_one_no_sync(
@@ -86,94 +87,59 @@ def logits_to_probs(
 
 
 def beam_search(
-    logits: List[torch.Tensor],
+    model: Transformer,
+    x: torch.Tensor,
+    input_pos: torch.Tensor,
     beam_width: int,
-    max_beam_steps: int,
-    temperature: float = 1.0,
-    top_k: Optional[int] = None,
-    min_p: Optional[float] = None
-) -> List[Tuple[List[int], float]]:
-    """
-    Performs beam search decoding.
+    max_length: int,
+    **sampling_kwargs,
+):
+    # Initialize the beam with the input sequence
+    beam = [(x, input_pos, 0.0)]  # (sequence, positions, log_prob)
 
-    Args:
-        logits (List[torch.Tensor]): 
-            A list where each element is a tensor of shape (1, vocab_size) 
-            representing the logits at each decoding step.
-        beam_width (int): 
-            The number of beams to keep at each step.
-        max_beam_steps (int): 
-            The maximum number of decoding steps.
-        temperature (float, optional): 
-            Temperature parameter for scaling logits. Default is 1.0.
-        top_k (Optional[int], optional): 
-            If specified, only the top_k tokens with highest probabilities are considered 
-            at each step. Default is None.
-        min_p (Optional[float], optional): 
-            If specified, filters out tokens with probabilities below min_p * max_prob 
-            at each step. Default is None.
+    for _ in range(max_length):
+        candidates = []
 
-    Returns:
-        List[Tuple[List[int], float]]: 
-            A list of tuples where each tuple contains a generated token sequence 
-            and its corresponding cumulative log probability.
-    """
-    # Initialize the beam with an empty sequence and a score of 0
-    beams: List[Tuple[List[int], float]] = [([], 0.0)]
+        for sequence, positions, log_prob in beam:
+            if positions[-1] == max_length - 1:
+                # If this sequence has reached max_length, keep it as is
+                candidates.append((sequence, positions, log_prob))
+            else:
+                # Get the next token probabilities
+                logits = model(sequence.cuda(), positions)
+                # add noise
+                noise = torch.randn_like(logits) * NOISE_SCALE
+                noisy_logits = logits[:, -1] + noise
+                probs = logits_to_probs(noisy_logits[:, -1].cpu(), **sampling_kwargs)
 
-    for step in range(max_beam_steps):
-        if step >= len(logits):
-            # print(f"Step {step}: No more logits provided. Stopping early.")
+                # Get top-k probabilities and indices
+                top_probs, top_indices = torch.topk(probs, beam_width)
+
+                for prob, idx in zip(top_probs[0], top_indices[0]):
+                    # print("seq, pos, idx", sequence, positions, idx)
+                    new_sequence = torch.cat(
+                        [sequence.cpu(), idx.unsqueeze(0).unsqueeze(0)], dim=1
+                    )
+                    new_positions = torch.cat(
+                        [positions, (positions[-1] + 1).unsqueeze(0)], dim=0
+                    )
+                    new_log_prob = log_prob + torch.log(prob).item()
+                    candidates.append((new_sequence, new_positions, new_log_prob))
+
+        # Select the top beam_width candidates
+        beam = sorted(candidates, key=lambda x: x[2], reverse=True)[:beam_width]
+
+        # Check if all beams have reached the end of sequence token
+        if all(sequence[0, -1] == EOS_TOKEN_ID for sequence, _, _ in beam):
             break
 
-        current_logits = logits[step].cpu()  # Shape: (1, vocab_size)
-        
-        # Convert logits to probabilities using the provided helper function
-        probs = logits_to_probs(
-            current_logits, 
-            temperature=temperature, 
-            top_k=top_k, 
-            min_p=min_p
-        ).squeeze(0)  # Shape: (vocab_size,)
+    # Return the sequence with the highest log probability
+    best_sequence, _, best_log_prob = max(beam, key=lambda x: x[2])
+    # print("beams", beam)
+    # print("beam result", best_sequence, best_log_prob)
+    print("beam result", tokenizer.decode(best_sequence.view(-1).tolist()))
+    return best_sequence, best_log_prob
 
-        # Convert probabilities to log probabilities to prevent underflow
-        log_probs = torch.log(probs + 1e-10)  # Adding epsilon for numerical stability
-
-        all_candidates: List[Tuple[List[int], float]] = []
-
-        # Iterate over each beam to expand
-        for seq, cum_log_prob in beams:
-            # Get the top `beam_width` tokens and their log probabilities
-            topk_log_probs, topk_indices = torch.topk(log_probs, beam_width)
-
-            for i in range(beam_width):
-                token = topk_indices[i].item()
-                token_log_prob = topk_log_probs[i].item()
-                
-                # Create a new sequence by appending the selected token
-                new_seq = seq + [token]
-                
-                # Update the cumulative log probability
-                new_cum_log_prob = cum_log_prob + token_log_prob
-                
-                # Add the new candidate to the list
-                all_candidates.append((new_seq, new_cum_log_prob))
-        
-        # Sort all candidates by their cumulative log probability in descending order
-        all_candidates = sorted(all_candidates, key=lambda x: x[1], reverse=True)
-        
-        # Select the top `beam_width` candidates to form the new beam
-        beams = all_candidates[:beam_width]
-        
-        # print(f"Step {step + 1}/{max_beam_steps}:")
-        # for i, (seq, score) in enumerate(beams):
-        #     print(f"  Beam {i + 1}: Sequence={seq}, Score={score:.4f}")
-
-    # find top beam, return tokens, probs
-    top_beam = max(beams, key=lambda x: x[1])
-    tokens, score = top_beam
-    # print(f"Top Beam: Sequence={tokens}, Score={score:.4f}")
-    return torch.tensor(tokens).cuda(), score
 
 def compute_entropy_and_varentropy(probs):
     # Ensure probs sum to 1 and handle zero probabilities
@@ -192,21 +158,12 @@ def compute_entropy_and_varentropy(probs):
     return entropy, varentropy
 
 
-def should_branch(probs, entropy, varentropy):
-    top_two_probs = torch.topk(probs, 2).values[0]
-    branch_value = (top_two_probs[0] - top_two_probs[1]) < BRANCH_THRESHOLD
-    # entropy_lower_bound = entropy < ENTROPY_BOUNDS[0]
-    entropy_lower_bound = False
-    entropy_upper_bound = entropy > ENTROPY_BOUNDS[1]
-    varentropy_low = varentropy < VARENTROPY_THRESHOLD
-
-    should_branch = (branch_value | entropy_lower_bound | entropy_upper_bound) & varentropy_low
-    if should_branch:
-        print(f"Top two: {top_two_probs[1].cpu().item(), top_two_probs[0].cpu().item()}, Entropy: {entropy}, Branch: {branch_value}, Entropy Lower: {entropy_lower_bound}, Entropy Upper: {entropy_upper_bound}")
-    return should_branch
-
-
-def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None, min_p: Optional[float] = None):
+def sample(
+    logits,
+    temperature: float = 1.0,
+    top_k: Optional[int] = None,
+    min_p: Optional[float] = None,
+):
     probs = logits_to_probs(logits[:, -1], temperature, top_k, min_p)
     idx_next = multinomial_sample_one_no_sync(probs)
     return idx_next, probs
@@ -214,40 +171,108 @@ def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None, min_p:
 
 def sample_with_entropy(
     logits,
+    x,
+    input_pos,
+    model,
     tokens_since_last_injection: int = 0,
     num_injections: int = 0,
     previous_token: Optional[int] = None,
     temperature: float = 1.0,
     top_k: Optional[int] = None,
     min_p: Optional[float] = None,
+    exclude_tokens: Optional[List[int]] = None,
 ):
     probs = logits_to_probs(logits[:, -1], temperature, top_k, min_p)
     entropy, varentropy = compute_entropy_and_varentropy(probs)
-    # print(f"Entropy: {entropy.item():.02f}, Varentropy: {varentropy.item():.02f}")
-    if should_branch(
-        probs, entropy, varentropy
-    ) :
-        print("===== Branching", entropy, varentropy)
+
+    should_backtrack = False
+    action = "sample"
+    idx_next = None
+
+    if entropy > varentropy and entropy > 3:
+        print("===== High entropy", entropy.item(), varentropy.item())
+
+    if entropy < ENTROPY_BOUNDS[0] and varentropy < VARENTROPY_BOUNDS[0]:
+        # low entropy and low varentropy, greedy decode w/argmax
+        idx_next = torch.argmax(probs, dim=-1).unsqueeze(0).cuda()
+        action = "greedy"
+    elif entropy > ENTROPY_BOUNDS[1] and (varentropy < VARENTROPY_BOUNDS[0]):
+        if (
+            tokens_since_last_injection > INJECTION_COOLDOWN
+            and previous_token in PUNCTUATION_TOKENS
+        ):
+            # high entropy, low varentropy, insert CoT
+            print("===== Injecting", entropy.item(), varentropy.item())
+            idx_next = torch.tensor(COT_TOKENS, device="cuda")[
+                torch.randint(len(COT_TOKENS), (1,))
+            ].unsqueeze(0)
+            tokens_since_last_injection = 0
+            num_injections += 1
+            action = "injection"
+        else:
+            # high entropy, low varentropy, sample
+            idx_next = multinomial_sample_one_no_sync(probs)
+    elif entropy < ENTROPY_BOUNDS[0] and varentropy > VARENTROPY_BOUNDS[1]:
+        # low entropy, high varentropy, branch
+        # print("===== Branching", entropy.item(), varentropy.item())
+        action = "branch"
         # adjust temperature and add noise by random multiplier between -0.1 and 0.1
         branching_temperature = temperature * (1 + (torch.rand(1) - 0.5) * 0.2)
-        noise = torch.randn_like(probs) * NOISE_SCALE
-        noisy_logits = logits[:, -1] + noise
         # beam search
-        idx_next, _ = beam_search(noisy_logits, 5, 5, temperature=branching_temperature, top_k=top_k, min_p=min_p)
-        idx_next = idx_next.unsqueeze(0)
+        # idx_next, _ = beam_search(
+        #     model,
+        #     x,
+        #     input_pos,
+        #     # noisy_logits,
+        #     5,
+        #     5,
+        #     temperature=branching_temperature,
+        #     top_k=top_k,
+        #     min_p=min_p,
+        # )
+        idx_next, _ = beam_search(
+            model,
+            x[:, : input_pos.clone() - 1],
+            input_pos.clone() - 1,
+            8,
+            16,
+            temperature=branching_temperature,
+            top_k=top_k,
+            min_p=min_p,
+        )
+        idx_next = idx_next.squeeze(0)[0].unsqueeze(0).unsqueeze(0)
+        idx_next = idx_next.to(device="cuda")
+        # print("Branching result", idx_next, idx_next.shape)
+    elif (entropy > ENTROPY_BOUNDS[1] and varentropy > VARENTROPY_BOUNDS[1]) or (entropy >5):
+        # high entropy, high varentropy, backtrack and resample
+        # print("===== Backtracking", entropy.item(), varentropy.item())
+        action = "backtrack"
+
+        should_backtrack = True
+        idx_next = multinomial_sample_one_no_sync(probs)
     else:
+        # regular sampling
         idx_next = multinomial_sample_one_no_sync(probs)
 
-    if num_injections < MAX_INJECTIONS and tokens_since_last_injection > INJECTION_COOLDOWN and varentropy < VARENTROPY_THRESHOLD and entropy > ENTROPY_THRESHOLD and previous_token in PUNCTUATION_TOKENS:
-        # randomly select from COT tokens
-        print("===== Injecting", entropy, varentropy)
-        idx_next = torch.tensor(COT_TOKENS, device="cuda")[torch.randint(len(COT_TOKENS), (1,))].unsqueeze(0)
-        tokens_since_last_injection = 0
-        num_injections += 1
-    else:
-        tokens_since_last_injection += 1
+    tokens_since_last_injection += 1
 
-    return idx_next, probs, tokens_since_last_injection, num_injections
+    next_token = idx_next.item() if idx_next else -1
+    global tokenizer
+    if next_token > 0:
+        token_str = tokenizer.decode([next_token])
+    else:
+        token_str = "<PAD>"
+    print(
+        f"Entropy: {entropy.item():.02f}, Varentropy: {varentropy.item():.02f}, Next token: {token_str}, Action: {action}"
+    )
+
+    return (
+        idx_next,
+        probs,
+        tokens_since_last_injection,
+        num_injections,
+        should_backtrack,
+    )
 
 
 def prefill(
@@ -258,7 +283,7 @@ def prefill(
     return sample(logits, **sampling_kwargs)[0]
 
 
-def decode_one_token(
+def decode_one_token_with_entropy(
     model: Transformer,
     x: torch.Tensor,
     input_pos: torch.Tensor,
@@ -270,10 +295,59 @@ def decode_one_token(
     # input_pos: [B, 1]
     assert input_pos.shape[-1] == 1
     logits = model(x, input_pos)
-    return sample_with_entropy(logits, tokens_since_last_injection, num_injections, previous_token, **sampling_kwargs)
+    return sample_with_entropy(
+        logits,
+        x,
+        input_pos,
+        model,
+        tokens_since_last_injection,
+        num_injections,
+        previous_token,
+        **sampling_kwargs,
+    )
+
+
+def decode_one_token(
+    model: Transformer,
+    x: torch.Tensor,
+    input_pos: torch.Tensor,
+    **sampling_kwargs,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # input_pos: [B, 1]
+    assert input_pos.shape[-1] == 1
+    logits = model(x, input_pos)
+    return sample(
+        logits,
+        **sampling_kwargs,
+    )
 
 
 def decode_n_tokens(
+    model: Transformer,
+    cur_token: torch.Tensor,
+    input_pos: torch.Tensor,
+    num_new_tokens: int,
+    callback=lambda _: _,
+    **sampling_kwargs,
+):
+    new_tokens, new_probs = [], []
+    for i in range(num_new_tokens):
+        with torch.backends.cuda.sdp_kernel(
+            enable_flash=False, enable_mem_efficient=False, enable_math=True
+        ):  # Actually better for Inductor to codegen attention here
+            next_token, next_prob = decode_one_token(
+                model, cur_token, input_pos, **sampling_kwargs
+            )
+            input_pos += 1
+            new_tokens.append(next_token.clone())
+            callback(new_tokens[-1])
+            new_probs.append(next_prob.clone())
+            cur_token = next_token.clone()
+
+    return new_tokens, new_probs
+
+
+def decode_n_tokens_with_entropy(
     model: Transformer,
     cur_token: torch.Tensor,
     input_pos: torch.Tensor,
@@ -283,14 +357,23 @@ def decode_n_tokens(
     **sampling_kwargs,
 ):
     new_tokens, new_probs = [], []
-    tokens_since_last_injection, num_injections = 0, 0
+    tokens_since_last_injection, num_injections, num_backspaces = 0, 0, 0
     found_eos = False
     previous_token = None
-    for i in range(num_new_tokens):
+
+    i = 0
+
+    while i < num_new_tokens:
         with torch.backends.cuda.sdp_kernel(
             enable_flash=False, enable_mem_efficient=False, enable_math=True
         ):  # Actually better for Inductor to codegen attention here
-            next_token, next_prob, tokens_since_last_injection, num_injections = decode_one_token(
+            (
+                next_token,
+                next_prob,
+                tokens_since_last_injection,
+                num_injections,
+                should_backtrack,
+            ) = decode_one_token_with_entropy(
                 model,
                 cur_token,
                 input_pos,
@@ -299,16 +382,32 @@ def decode_n_tokens(
                 previous_token,
                 **sampling_kwargs,
             )
-            if next_token.item() == EOS_TOKEN_ID:
+            if should_backtrack and i > 1:
+                num_backspaces += 1
+                if num_backspaces <= MAX_BACKSPACES:
+                    # Backtrack and resample
+                    i -= 1
+                    print(f"==== Backtracked, resampling with {i} tokens")
+                    if i < 0:
+                        break
+                    new_tokens.pop()
+                    new_probs.pop()
+                    cur_token = new_tokens[-1].clone()
+                    input_pos -= 1
+                    tokens_since_last_injection -= 1
+                    continue
+
+            if next_token and next_token.item() == EOS_TOKEN_ID:
                 found_eos = True
-            if not found_eos:
-                print(tokenizer.decode(next_token.view(-1).tolist()), next_token.item())
+            # if next_token and not found_eos:
+            # print(tokenizer.decode(next_token.view(-1).tolist()))
             input_pos += 1
             new_tokens.append(next_token.clone())
             callback(new_tokens[-1])
             new_probs.append(next_prob.clone())
             cur_token = next_token.clone()
             previous_token = next_token.item()
+            i += 1
 
     return new_tokens, new_probs
 
@@ -451,7 +550,7 @@ def generate(
             input_pos = input_pos + num_added
             next_token = next_tokens[-1]
     else:
-        generated_tokens, _ = decode_n_tokens(
+        generated_tokens, _ = decode_n_tokens_with_entropy(
             model,
             next_token.view(batch_size, -1),
             input_pos,
@@ -585,10 +684,21 @@ def main(
     device_sync(device=device)  # MKG
     print(f"Time to load model: {time.time() - t0:.02f} seconds")
 
+    global tokenizer
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
 
     print("COT TOKEN", tokenizer.encode("Wait"))
+    print("COT TOKEN", tokenizer.encode("oh"))
+    print("COT TOKEN", tokenizer.encode("aha"))
     print("PUNC TOKEN", tokenizer.encode("."))
+    print("PUNC TOKEN", tokenizer.encode(". "))
+    print("PUNC TOKEN", tokenizer.encode("."))
+    print("PUNC TOKEN", tokenizer.encode(".\n"))
+    print("PUNC TOKEN", tokenizer.encode("?"))
+    print("PUNC TOKEN", tokenizer.encode("? "))
+    print("PUNC TOKEN", tokenizer.encode("?\n"))
+    print("PUNC TOKEN", tokenizer.encode("!"))
+    print("PUNC TOKEN", tokenizer.encode("! "))
 
     # print("EOS TOKEN", tokenizer.eos_id())
 
@@ -654,6 +764,22 @@ def main(
                 # print(, end='', flush=True)
         else:
             callback = lambda x: x
+            # buffer = []
+            # period_id = tokenizer.encode(".")[0]
+            # done_generating = False
+            # def callback(x):
+            #     nonlocal done_generating
+            #     if done_generating:
+            #         return
+            #     tokens = tokenizer.decode([period_id] + [x.item()])
+            #     # print(tokens, end="", flush=True)
+            #     buffer.append(tokens[1:])
+            #     if x.item() == tokenizer.eos_id():
+            #         done_generating = True
+            #     if len(buffer) == 4 or done_generating:
+            #         print("".join(buffer), end="", flush=True)
+            #         buffer.clear()
+
         t0 = time.perf_counter()
         import contextlib
 
@@ -731,7 +857,7 @@ default_prompt = """<|start_header_id|>system<|end_header_id|>
 You are a world-class AI system, capable of complex reasoning. Begin your response with <thinking> tags and think step by step through the query, and then provide your final response inside <output> tags.<|eot_id|><|start_header_id|>user<|end_header_id|>
 
 Which number is larger, 9.9 or 9.11?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-<thinking>"""
+<thinking>\n"""
 
 if __name__ == "__main__":
     import argparse
@@ -762,10 +888,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size", type=int, default=1, help="Batch size to benchmark with"
     )
-    parser.add_argument("--top_k", type=int, default=200, help="Top-k for sampling.")
+    parser.add_argument("--top_k", type=int, default=50, help="Top-k for sampling.")
     parser.add_argument("--min_p", type=float, default=None, help="Min-p for sampling.")
     parser.add_argument(
-        "--temperature", type=float, default=0.8, help="Temperature for sampling."
+        "--temperature", type=float, default=0.666, help="Temperature for sampling."
     )
     parser.add_argument(
         "--checkpoint_path",
