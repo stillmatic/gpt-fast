@@ -12,6 +12,12 @@ import torch.nn as nn
 from torch import Tensor
 from torch.nn import functional as F
 
+if torch.backends.mps.is_available():
+    device = torch.device("mps")
+elif torch.cuda.is_available():
+    device = torch.device("cuda")
+else:
+    device = torch.device("cpu")
 
 def find_multiple(n: int, k: int) -> int:
     if n % k == 0:
@@ -105,6 +111,43 @@ class KVCache(nn.Module):
 
         return k_out, v_out
 
+from typing import NamedTuple
+
+class AttnStats(NamedTuple):
+    entropy: torch.Tensor  # (bsz, n_layers, num_heads)
+    varentropy: torch.Tensor  # (bsz, n_layers, num_heads)
+    n_layers: int
+    n_heads: int
+
+    @classmethod
+    def new(cls, bsz: int, n_layers: int, n_heads: int) -> 'AttnStats':
+        return cls(
+            entropy=torch.zeros((bsz, n_layers, n_heads), dtype=torch.float32, device=device),
+            varentropy=torch.zeros((bsz, n_layers, n_heads), dtype=torch.float32, device=device),
+            n_layers=n_layers,
+            n_heads=n_heads
+        )
+
+    @property
+    def avg_entropy(self):
+        return self.entropy.sum(dim=-1, keepdim=False)  # Average across heads
+
+    @property
+    def std_error(self):
+        return torch.sqrt(torch.mean(self.varentropy)) / (self.n_heads * self.n_layers)
+
+    def update(self, scores: torch.Tensor, layer_idx: int):
+        # scores shape: (bsz, n_heads, seqlen, n_words)
+        probs = torch.nn.functional.softmax(scores, dim=-1)
+        new_entropy = -torch.sum(torch.where(probs > 0, probs * torch.log(probs), torch.tensor(0.0)), dim=-1)
+        new_varentropy = torch.sum(probs * (torch.log(probs) + new_entropy.unsqueeze(-1))**2, dim=-1)
+
+        # Update entropy and varentropy tensors
+        self.entropy[:, layer_idx, :] = new_entropy
+        self.varentropy[:, layer_idx, :] = new_varentropy
+
+        return self
+
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
@@ -145,6 +188,8 @@ class Transformer(nn.Module):
         freqs_cis = self.freqs_cis[input_pos]
         x = self.tok_embeddings(idx)
 
+        # stats = AttnStats.new(x.size(0), self.config.n_layer, self.config.n_head)
+
         for i, layer in enumerate(self.layers):
             x = layer(x, input_pos, freqs_cis, mask)
         x = self.norm(x)
@@ -165,7 +210,9 @@ class TransformerBlock(nn.Module):
         self.attention_norm = RMSNorm(config.dim, config.norm_eps)
 
     def forward(self, x: Tensor, input_pos: Tensor, freqs_cis: Tensor, mask: Tensor) -> Tensor:
-        h = x + self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+        scores = self.attention(self.attention_norm(x), freqs_cis, mask, input_pos)
+        
+        h = x + scores
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 

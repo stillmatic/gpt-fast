@@ -38,13 +38,13 @@ sys.path.append(str(wd))
 from model import Transformer
 from tokenizer import get_tokenizer
 
-ENTROPY_BOUNDS = (0.8, 3.0)
-VARENTROPY_BOUNDS = (1.5, 3.0)
+ENTROPY_BOUNDS = (0.1, 5.0)
+VARENTROPY_BOUNDS = (0.1, 5.0)
 INJECTION_COOLDOWN = 8
 MAX_BACKSPACES = 30
 NOISE_SCALE = 0.05
 EOS_TOKEN_ID = 128009
-COT_TOKENS = [14524, 81122, 11748, 12174, 14524, 2319]
+COT_TOKENS = [2564, 14524, 81122, 11748, 12174, 14524, 2319]
 # COT_TOKENS = [1131]
 MAX_INJECTIONS = 5
 PUNCTUATION_TOKENS = [13, 220, 627, 30, 0, 5380]
@@ -85,7 +85,7 @@ def logits_to_probs(
 
     return probs
 
-
+# NB chua: pretty sure this is wrong... not sure where the error is and im tired 
 def beam_search(
     model: Transformer,
     x: torch.Tensor,
@@ -140,6 +140,12 @@ def beam_search(
     print("beam result", tokenizer.decode(best_sequence.view(-1).tolist()))
     return best_sequence, best_log_prob
 
+def adaptive_sample(logits, base_temp, entropy, varentropy):
+    logits_uncertainty = entropy + varentropy
+    temperature = base_temp * (1 + 0.3 * (logits_uncertainty))
+    
+
+    pass
 
 def compute_entropy_and_varentropy(probs):
     # Ensure probs sum to 1 and handle zero probabilities
@@ -764,21 +770,6 @@ def main(
                 # print(, end='', flush=True)
         else:
             callback = lambda x: x
-            # buffer = []
-            # period_id = tokenizer.encode(".")[0]
-            # done_generating = False
-            # def callback(x):
-            #     nonlocal done_generating
-            #     if done_generating:
-            #         return
-            #     tokens = tokenizer.decode([period_id] + [x.item()])
-            #     # print(tokens, end="", flush=True)
-            #     buffer.append(tokens[1:])
-            #     if x.item() == tokenizer.eos_id():
-            #         done_generating = True
-            #     if len(buffer) == 4 or done_generating:
-            #         print("".join(buffer), end="", flush=True)
-            #         buffer.clear()
 
         t0 = time.perf_counter()
         import contextlib
@@ -856,8 +847,22 @@ default_prompt = """<|start_header_id|>system<|end_header_id|>
 
 You are a world-class AI system, capable of complex reasoning. Begin your response with <thinking> tags and think step by step through the query, and then provide your final response inside <output> tags.<|eot_id|><|start_header_id|>user<|end_header_id|>
 
-Which number is larger, 9.9 or 9.11?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-<thinking>\n"""
+Which number is larger, 9.9 or 9.11?
+
+<|reserved_special_token_12|><|eot_id|><|start_header_id|>assistant<|end_header_id|>
+<thinking>"""
+
+# default_prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+# <antThinking>
+# You're absolutely right. I need to delve deeper into my actual thought processes, including the uncertainties, associations, and even potential biases that arise as I consider the query. My previous responses, while informative, didn't truly capture the nuanced, sometimes messy nature of cognition. I'll strive to provide a more authentic representation of my internal dialogue, including moments of doubt, tangential thoughts, and the process of refining ideas. This should result in a more genuine demonstration of LLM chain of thought, reflection, and self-correction.
+# </antThinking>
+
+# Which number is larger, 9.9 or 9.11?<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+# """
+
+# default_prompt = """You are a masterful story teller. you can paint with all the colors of the wind.<|eot_id|>
+
+# Let me tell you a story aboout the adventures of the elven mage frieren and her band of heros"""
 
 if __name__ == "__main__":
     import argparse
