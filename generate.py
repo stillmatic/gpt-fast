@@ -81,39 +81,59 @@ def compute_entropy_and_varentropy(probs):
 
     return entropy, varentropy
 
+def _compute_entropy(probs):
+    # Ensure probs sum to 1 and handle zero probabilities
+    probs = probs.clamp(min=1e-12)
+    probs = probs / probs.sum()
 
-def sample(logits, temperature: float = 1.0, top_k: Optional[int] = None, min_p: Optional[float] = None):
+    # Compute entropy
+    log_probs = torch.log2(probs)  # Using log base 2
+    entropy = -torch.sum(probs * log_probs)
+
+    return entropy
+
+
+def sample(logits, should_compute_entropy: bool = False, temperature: float = 1.0, top_k: Optional[int] = None, min_p: Optional[float] = None):
     probs = logits_to_probs(logits[:, -1], temperature, top_k, min_p)
-    entropy, varentropy = compute_entropy_and_varentropy(probs)
-    
+    if should_compute_entropy:
+        entropy = _compute_entropy(probs)
+    else:
+        entropy = 0.0
     idx_next = multinomial_sample_one_no_sync(probs)
-    print(f"Entropy: {entropy.item():.02f}, Varentropy: {varentropy.item():.02f}")
-    return idx_next, probs
+    return idx_next, probs, entropy
 
 def prefill(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> torch.Tensor:
     # input_pos: [B, S]
     logits = model(x, input_pos)
-    return sample(logits, **sampling_kwargs)[0]
+    return sample(logits, should_compute_entropy=False, **sampling_kwargs)[0]
 
-def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
+def decode_one_token(model: Transformer, x: torch.Tensor, input_pos: torch.Tensor, should_compute_entropy: bool=False, **sampling_kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
     # input_pos: [B, 1]
     assert input_pos.shape[-1] == 1
     logits = model(x, input_pos)
-    return sample(logits, **sampling_kwargs)
+    return sample(logits, should_compute_entropy, **sampling_kwargs)
 
-def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, tokenizer, callback=lambda _: _, **sampling_kwargs):
+def decode_n_tokens(model: Transformer, cur_token: torch.Tensor, input_pos: torch.Tensor, num_new_tokens: int, speculate_entropy_threshold: float = float("inf"), callback=lambda _: _, **sampling_kwargs):
+    """Decode UP TO n tokens.
+    
+    We add an entropy threshold that breaks the loop if the entropy of the last decoded token is too high.
+    This should only be used for speculative decoding.
+    """
     new_tokens, new_probs = [], []
     for i in range(num_new_tokens):
         with torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True): # Actually better for Inductor to codegen attention here
-            next_token, next_prob = decode_one_token(
-                model, cur_token, input_pos, **sampling_kwargs
+            should_compute_entropy = speculate_entropy_threshold < float("inf")
+            next_token, next_prob, entropy = decode_one_token(
+                model, cur_token, input_pos, should_compute_entropy=should_compute_entropy, **sampling_kwargs
             )
-            print(tokenizer.decode(next_token.view(-1).tolist()))
             input_pos += 1
             new_tokens.append(next_token.clone())
             callback(new_tokens[-1])
             new_probs.append(next_prob.clone())
             cur_token = next_token.clone()
+
+            if entropy > speculate_entropy_threshold:
+                break
 
     return new_tokens, new_probs
 
@@ -127,37 +147,40 @@ def speculative_decode(
     cur_token: torch.Tensor,
     input_pos: int,
     speculate_k: int,
+    speculate_entropy_threshold: float = float("inf"),
     **sampling_kwargs
 ) -> torch.Tensor:
     # draft model inference sequentially
     device = cur_token.device
     orig_input_pos = torch.tensor([input_pos], dtype=torch.int64, device=cur_token.device)
-    draft_tokens, draft_probs = decode_n_tokens(draft_model, cur_token.view(1, -1), orig_input_pos.clone(), speculate_k, **sampling_kwargs)
+    draft_tokens, draft_probs = decode_n_tokens(draft_model, cur_token.view(1, -1), orig_input_pos.clone(), speculate_k, speculate_entropy_threshold, **sampling_kwargs)
+    # NB chua: replace fixed spec_k with num_decoded (number of draft tokens before entropy threshold is tripped)
+    num_decoded = len(draft_tokens)
     draft_tokens = torch.cat(draft_tokens).view(-1)
     # parallel inference on target model using draft tokens
     target_logits = model_forward(
         model,
         torch.cat([cur_token.view(1), draft_tokens]).view(1, -1),
-        torch.arange(input_pos, input_pos + speculate_k + 1, device=cur_token.device)
+        torch.arange(input_pos, input_pos + num_decoded + 1, device=cur_token.device)
     )
     target_probs = logits_to_probs(target_logits[0], **sampling_kwargs)
     draft_probs = torch.stack(draft_probs).squeeze(1)
     # q: target prob, p: draft prob
     # q >= p: always accept draft token
     # q < p: q/p prob to accept draft token
-    p = draft_probs[torch.arange(0, speculate_k, device=device), draft_tokens]
-    q = target_probs[torch.arange(0, speculate_k, device=device), draft_tokens]
-    accept_draft_prob = torch.minimum(torch.ones(()), q[:speculate_k]/ p)
+    p = draft_probs[torch.arange(0, num_decoded, device=device), draft_tokens]
+    q = target_probs[torch.arange(0, num_decoded, device=device), draft_tokens]
+    accept_draft_prob = torch.minimum(torch.ones(()), q[:num_decoded]/ p)
     rejected_locations = (torch.rand_like(accept_draft_prob) > accept_draft_prob).nonzero()
     final_tokens = None
     if rejected_locations.shape[0] == 0: # All draft tokens have been accepted
-        accept_length = speculate_k + 1
+        accept_length = num_decoded + 1
         last_token = multinomial_sample_one_no_sync(target_probs[-1])
         # fill last token into draft model
         model_forward(
             draft_model,
             draft_tokens[-1].view(1, -1),
-            orig_input_pos + speculate_k,
+            orig_input_pos + num_decoded,
         )
         final_tokens= torch.cat([draft_tokens, last_token])
     else:
@@ -169,7 +192,7 @@ def speculative_decode(
         new = new / new.sum()
         next_token = multinomial_sample_one_no_sync(new)
         final_tokens = torch.cat([draft_tokens[:accept_length], next_token])
-    return final_tokens
+    return final_tokens, num_decoded
 
 @torch.no_grad()
 def generate(
@@ -182,6 +205,7 @@ def generate(
     interactive: bool,
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
+    speculate_entropy_threshold: float = float("inf"),
     callback = lambda x: x,
     **sampling_kwargs
 ) -> torch.Tensor:
@@ -220,16 +244,17 @@ def generate(
 
     input_pos = torch.tensor([T], device=device, dtype=torch.int)
     accept_counts = [0] * (speculate_k + 1)
+    draft_counts = [0] * (speculate_k + 1)
 
     if is_speculative:
         input_pos = input_pos.item()  # for speculative decoding easier to keep on host
         while input_pos < T_new - 1:
             cur_token = next_token.view(())
 
-            next_tokens = speculative_decode(
-                model, draft_model, cur_token, input_pos, speculate_k, **sampling_kwargs
+            next_tokens, draft_count = speculative_decode(
+                model, draft_model, cur_token, input_pos, speculate_k, speculate_entropy_threshold, **sampling_kwargs
             )
-
+            draft_counts[draft_count] += 1
             accept_counts[len(next_tokens) - 1] += 1
             num_added = min(T_new - input_pos - 1, len(next_tokens))
             seq[:, input_pos + 1 : input_pos + num_added + 1] = next_tokens[: num_added]
@@ -242,7 +267,9 @@ def generate(
         seq[:, T + 1:] = torch.cat(generated_tokens, dim=-1)
 
     generate_stats = {
-        'accept_counts': accept_counts
+        'accept_counts': accept_counts,
+        'draft_counts': draft_counts,
+        'draft_accept_pairs': list(zip(draft_counts, accept_counts))
     }
     return seq, generate_stats
 
@@ -304,6 +331,57 @@ def _get_model_size(model):
             )
     return model_size, params
 
+def _aggregate_and_visualize_pairs(draft_accept_pairs):
+    """
+    Aggregates draft-accept pairs and creates a matrix visualization.
+    
+    Args:
+        draft_accept_pairs: List of tuples, each containing (draft_count, accept_count)
+    
+    Returns:
+        matrix: 2D list representing the frequency matrix
+        row_labels: List of unique draft counts
+        col_labels: List of unique accept counts
+    """
+    # Count frequency of each pair
+    pair_counts = {}
+    for draft, accept in draft_accept_pairs:
+        pair = (draft, accept)
+        pair_counts[pair] = pair_counts.get(pair, 0) + 1
+    
+    # Get unique values for drafts and accepts
+    draft_counts = sorted(set(draft for draft, _ in draft_accept_pairs))
+    accept_counts = sorted(set(accept for _, accept in draft_accept_pairs))
+    
+    # Create matrix
+    matrix = []
+    for draft in draft_counts:
+        row = []
+        for accept in accept_counts:
+            count = pair_counts.get((draft, accept), 0)
+            row.append(count)
+        matrix.append(row)
+    
+    return matrix, draft_counts, accept_counts
+
+def _print_matrix(matrix, row_labels, col_labels):
+    """
+    Prints the matrix in a readable format.
+    """
+    # Print column headers
+    print("      ", end="")
+    for col in col_labels:
+        print(f"{col:4}", end=" ")
+    print("\n")
+    
+    # Print rows with labels
+    for i, row in enumerate(matrix):
+        print(f"{row_labels[i]:4} |", end=" ")
+        for val in row:
+            print(f"{val:4}", end=" ")
+        print()
+
+
 B_INST, E_INST = "[INST]", "[/INST]"
 
 def main(
@@ -322,6 +400,7 @@ def main(
     speculate_k: int = 5,
     device=default_device,
     min_p: Optional[float] = None,
+    speculate_entropy_threshold: float = float("inf"),
 ) -> None:
     """Generates text samples based on a pre-trained Transformer model and tokenizer.
     """
@@ -372,8 +451,10 @@ def main(
             torch._inductor.config.triton.cudagraph_trees = False # Bug with cudagraph trees in this case
 
         if is_speculative:
-            global model_forward, logits_to_prob
+            global model_forward, logits_to_prob, _compute_entropy
             model_forward = torch.compile(model_forward, mode="reduce-overhead", fullgraph=True)
+            # TODO: benchmark if compiling entropy calculation is worth it
+            _compute_entropy = torch.compile(_compute_entropy, mode="reduce-overhead", fullgraph=True)
 
         global decode_one_token, prefill
         decode_one_token = torch.compile(decode_one_token, mode="reduce-overhead", fullgraph=True)
@@ -386,6 +467,8 @@ def main(
     aggregate_metrics = {
         'tokens_per_sec': [],
         'accept_counts': [],
+        'draft_counts': [],
+        'draft_accept_pairs': []
     }
     start = -1 if compile else 0
 
@@ -430,6 +513,7 @@ def main(
                 batch_size=batch_size,
                 draft_model=draft_model,
                 speculate_k=speculate_k,
+                speculate_entropy_threshold=speculate_entropy_threshold,
                 interactive=interactive,
                 callback=callback,
                 temperature=temperature,
@@ -437,6 +521,8 @@ def main(
                 min_p=min_p,
             )
             aggregate_metrics['accept_counts'].append(metrics['accept_counts'])
+            aggregate_metrics['draft_counts'].append(metrics['draft_counts'])
+            aggregate_metrics['draft_accept_pairs'].extend(metrics['draft_accept_pairs'])
         if i == -1:
             print(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
             continue
@@ -467,8 +553,15 @@ def main(
     if is_speculative:
         counts_aggregated = [sum(i) for i in zip(*aggregate_metrics['accept_counts'])]
         acceptance_probs = [i/sum(counts_aggregated) for i in counts_aggregated]
+        drafts_aggregated = [sum(i) for i in zip(*aggregate_metrics['draft_counts'])]
+        # aggregate draft_accept_pairs. is a list of tuples of draft_count, accept_count
+        # we want to count the number of times each pair occurs and draw a matrix
+        draft_accept_pairs = _aggregate_and_visualize_pairs(aggregate_metrics['draft_accept_pairs'])
+        
         print(f"Acceptance probs: {acceptance_probs}")
+        print(f"Num proposed drafts: {drafts_aggregated}")
         print(f"Mean Accepted: {sum([idx * i for idx, i in enumerate(counts_aggregated)])/sum(counts_aggregated)}")
+        _print_matrix(*draft_accept_pairs)
 
     print(f"Batch Size: {batch_size}")
     print(f"Prompt Length: {prompt_length}")
@@ -502,7 +595,8 @@ if __name__ == '__main__':
     parser.add_argument('--compile', action='store_true', help='Whether to compile the model.')
     parser.add_argument('--compile_prefill', action='store_true', help='Whether to compile the prefill (improves prefill perf, but higher compile times)')
     parser.add_argument('--profile', type=Path, default=None, help='Profile path.')
-    parser.add_argument('--speculate_k', type=int, default=5, help='Speculative execution depth.')
+    parser.add_argument('--speculate_k', type=int, default=5, help='Maximum speculative execution depth.')
+    parser.add_argument('--speculate_entropy_threshold', type=float, default=float("inf"), help='Maximum entropy to decode another draft token with.')
     parser.add_argument('--draft_checkpoint_path', type=Path, default=None, help='Draft checkpoint path.')
     parser.add_argument('--device', type=str, default=default_device, help='Device to use')
 
@@ -510,5 +604,5 @@ if __name__ == '__main__':
     main(
         args.prompt, args.interactive, args.num_samples, args.max_new_tokens, args.batch_size, args.top_k,
         args.temperature, args.checkpoint_path, args.compile, args.compile_prefill, args.profile, args.draft_checkpoint_path,
-        args.speculate_k, args.device, args.min_p
+        args.speculate_k, args.device, args.min_p, args.speculate_entropy_threshold
     )
