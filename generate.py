@@ -208,7 +208,7 @@ def speculative_decode(
         orig_input_pos.clone(),
         speculate_k,
         speculate_entropy_threshold,
-        speculate_min_k,
+        min_new_tokens=speculate_min_k,
         **sampling_kwargs,
     )
     # NB chua: replace fixed spec_k with num_decoded (number of draft tokens before entropy threshold is tripped)
@@ -266,7 +266,7 @@ def generate(
     draft_model: Transformer,
     speculate_k: Optional[int] = 8,
     speculate_entropy_threshold: float = float("inf"),
-    speculate_min_k,
+    speculate_min_k: int = 0,
     callback=lambda x: x,
     **sampling_kwargs,
 ) -> torch.Tensor:
