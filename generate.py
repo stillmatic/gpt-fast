@@ -14,6 +14,10 @@ import torch
 import torch.nn.functional as F
 import torch._dynamo.config
 import torch._inductor.config
+from prompts import magpie_prompts
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text
 
 
 def device_sync(device):
@@ -115,11 +119,11 @@ def sample(
 ):
     probs = logits_to_probs(logits[:, -1], temperature, top_k, min_p)
     if should_compute_entropy:
-        entropy = _compute_entropy(probs)
+        entropy, varentropy = compute_entropy_and_varentropy(probs)
     else:
-        entropy = 0.0
+        entropy, varentropy = 0.0, 0.0
     idx_next = multinomial_sample_one_no_sync(probs)
-    return idx_next, probs, entropy
+    return idx_next, probs, entropy, varentropy
 
 
 def prefill(
@@ -158,13 +162,14 @@ def decode_n_tokens(
     We add an entropy threshold that breaks the loop if the entropy of the last decoded token is too high.
     This should only be used for speculative decoding.
     """
+    per_item_multiplier = 0.5 / num_new_tokens
     new_tokens, new_probs = [], []
     for i in range(num_new_tokens):
         with torch.backends.cuda.sdp_kernel(
             enable_flash=False, enable_mem_efficient=False, enable_math=True
         ):  # Actually better for Inductor to codegen attention here
             should_compute_entropy = speculate_entropy_threshold < float("inf")
-            next_token, next_prob, entropy = decode_one_token(
+            next_token, next_prob, entropy, _ = decode_one_token(
                 model,
                 cur_token,
                 input_pos,
@@ -177,9 +182,14 @@ def decode_n_tokens(
             new_probs.append(next_prob.clone())
             cur_token = next_token.clone()
 
-            if entropy > speculate_entropy_threshold and i >= min_new_tokens:
-                break
-
+            if i >= min_new_tokens:
+                top_prob = next_prob[0, next_token].item()
+                new_threshold = 0.2 + (per_item_multiplier * i)
+                # print(top_prob, new_threshold)
+                # if top_prob < new_threshold or entropy > speculate_entropy_threshold:
+                    # break
+                if entropy > (speculate_entropy_threshold / max(i-min_new_tokens, 1)):
+                    break
     return new_tokens, new_probs
 
 
@@ -456,33 +466,33 @@ def _aggregate_and_visualize_pairs(draft_accept_pairs):
 
 def _print_matrix(matrix, row_labels, col_labels):
     """
-    Prints the matrix in a readable format with axis labels.
+    Prints the matrix in a readable format with axis labels using Rich.
     """
-    # Calculate padding for row labels
-    max_row_label_width = max(len(str(x)) for x in row_labels)
-    padding = max(max_row_label_width, 4)
-
-    # Print title and x-axis label
-    title_padding = padding + 6 + len(col_labels) * 5 // 2
-    print(" " * title_padding + "Accept Count (X)")
-
-    # Print column headers
-    print(" " * (padding + 6), end="")
+    console = Console()
+    table = Table(
+        title="Accept Count (X)",
+        show_header=True,
+        header_style="bold cyan",
+        show_lines=True,
+        title_justify="center"
+    )
+    
+    # Add Draft Count column
+    table.add_column("Draft\nCount", justify="right", style="bold green")
+    
+    # Add columns for each accept count
     for col in col_labels:
-        print(f"{col:4}", end=" ")
-    print("\n")
-
-    # Print y-axis label and rotate it
-    print(" " * padding + "Draft")
-    print(" " * padding + "Count")
-    print(" " * padding + " (Y) ")
-
-    # Print rows with labels
+        table.add_column(str(col), justify="right")
+    
+    # Add rows with data
     for i, row in enumerate(matrix):
-        print(f"{str(row_labels[i]):>{padding}} |", end=" ")
-        for val in row:
-            print(f"{val:4}", end=" ")
-        print()
+        # Convert row values to strings with right alignment
+        row_data = [str(val) for val in row]
+        # Insert row label at the beginning
+        table.add_row(str(row_labels[i]), *row_data)
+    
+    # Print the table
+    console.print(table)
 
 
 B_INST, E_INST = "[INST]", "[/INST]"
@@ -544,13 +554,6 @@ def main(
 
     tokenizer = get_tokenizer(tokenizer_path, checkpoint_path)
 
-    if isinstance(prompt, str):
-        encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
-    else:
-        # generate a fully synthetic prompt
-        encoded = torch.randint(0, 1024, (prompt,), device=device, dtype=torch.int64)
-    prompt_length = encoded.size(-1)
-
     torch.manual_seed(1234)
     model_size, params = _get_model_size(model)
     if compile:
@@ -560,14 +563,14 @@ def main(
             )
 
         if is_speculative:
-            global model_forward, logits_to_prob, _compute_entropy
+            global model_forward, logits_to_prob
             model_forward = torch.compile(
                 model_forward, mode="reduce-overhead", fullgraph=True
             )
             # TODO: benchmark if compiling entropy calculation is worth it
-            _compute_entropy = torch.compile(
-                _compute_entropy, mode="reduce-overhead", fullgraph=True
-            )
+            # _compute_entropy = torch.compile(
+            #     _compute_entropy, mode="reduce-overhead", fullgraph=True
+            # )
 
         global decode_one_token, prefill
         decode_one_token = torch.compile(
@@ -577,6 +580,20 @@ def main(
         # Uncomment to squeeze more perf out of prefill
         if compile_prefill:
             prefill = torch.compile(prefill, fullgraph=True, dynamic=True)
+
+    if not isinstance(prompt, str):
+        templ = """<|begin_of_text|><|start_header_id|>system<|end_header_id|>
+You are a helpful assistant<|eot_id|><|start_header_id|>user<|end_header_id|>
+{user_content}<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
+        prompt = templ.format(user_content=magpie_prompts[prompt])
+
+    if isinstance(prompt, str):
+        encoded = encode_tokens(tokenizer, prompt, bos=True, device=device)
+    else:
+        # generate a fully synthetic prompt
+        # NB chua: SHOULD NOT BE CALLED
+        encoded = torch.randint(0, 1024, (prompt,), device=device, dtype=torch.int64)
+    prompt_length = encoded.size(-1)
 
     aggregate_metrics = {
         "tokens_per_sec": [],
@@ -588,6 +605,7 @@ def main(
 
     for i in range(start, num_samples):
         device_sync(device=device)  # MKG
+        
         if i >= 0 and interactive:
             prompt = input("What is your prompt? ")
             if is_chat:
